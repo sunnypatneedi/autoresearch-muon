@@ -206,6 +206,15 @@ def train_tokenizer():
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
+def detect_device():
+    """Return (torch.device, device_type_str) for the best available backend."""
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    elif torch.backends.mps.is_available():
+        return torch.device("mps"), "mps"
+    return torch.device("cpu"), "cpu"
+
+
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
 
@@ -292,10 +301,12 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
+    _, _dl_device = detect_device()
+
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(_dl_device == "cuda"))
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=_dl_device)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -340,7 +351,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, eval_tokens=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -348,9 +359,9 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=next(model.parameters()).device)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    steps = (eval_tokens or EVAL_TOKENS) // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):

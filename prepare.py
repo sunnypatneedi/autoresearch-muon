@@ -17,11 +17,15 @@ import argparse
 import pickle
 from multiprocessing import Pool
 
+import numpy as np
 import requests
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -90,6 +94,10 @@ def download_single_shard(index):
 
 def download_data(num_shards, download_workers=8):
     """Download training shards + pinned validation shard."""
+    if num_shards < 0:
+        raise ValueError("num_shards must be >= 0")
+    if download_workers < 1:
+        raise ValueError("download_workers must be >= 1")
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
     ids = list(range(num_train))
@@ -128,22 +136,27 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
     nchars = 0
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+        try:
+            for rg_idx in range(pf.num_row_groups):
+                rg = pf.read_row_group(rg_idx)
+                for text in rg.column("text").to_pylist():
+                    doc = text[:doc_cap] if len(text) > doc_cap else text
+                    nchars += len(doc)
+                    yield doc
+                    if nchars >= max_chars:
+                        return
+        finally:
+            pf.close()
 
 
 def train_tokenizer():
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    token_bytes_pt = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    token_bytes_npy = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
+    has_token_bytes = os.path.exists(token_bytes_pt) or os.path.exists(token_bytes_npy)
+    if os.path.exists(tokenizer_pkl) and has_token_bytes:
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
         return
 
@@ -191,9 +204,12 @@ def train_tokenizer():
             token_bytes_list.append(0)
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    token_bytes_arr = np.array(token_bytes_list, dtype=np.int32)
+    np.save(token_bytes_npy, token_bytes_arr)
+    print(f"Tokenizer: saved token_bytes to {token_bytes_npy}")
+    if torch is not None:
+        torch.save(torch.from_numpy(token_bytes_arr), token_bytes_pt)
+        print(f"Tokenizer: saved token_bytes to {token_bytes_pt}")
 
     # Sanity check
     test = "Hello world! Numbers: 123. Unicode: 你好"
@@ -205,6 +221,15 @@ def train_tokenizer():
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
+
+def detect_device():
+    """Return (torch.device, device_type_str) for the best available backend."""
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    elif torch.backends.mps.is_available():
+        return torch.device("mps"), "mps"
+    return torch.device("cpu"), "cpu"
+
 
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
@@ -246,9 +271,14 @@ class Tokenizer:
 
 
 def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+    pt_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    npy_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    if os.path.exists(pt_path):
+        with open(pt_path, "rb") as f:
+            return torch.load(f, map_location=device)
+    # Fallback: load .npy and convert to torch tensor
+    arr = np.load(npy_path)
+    return torch.from_numpy(arr).to(device)
 
 
 def _document_batches(split, tokenizer_batch_size=128):
@@ -264,11 +294,14 @@ def _document_batches(split, tokenizer_batch_size=128):
     while True:
         for filepath in parquet_paths:
             pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+            try:
+                for rg_idx in range(pf.num_row_groups):
+                    rg = pf.read_row_group(rg_idx)
+                    batch = rg.column('text').to_pylist()
+                    for i in range(0, len(batch), tokenizer_batch_size):
+                        yield batch[i:i+tokenizer_batch_size], epoch
+            finally:
+                pf.close()
         epoch += 1
 
 
@@ -292,10 +325,12 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
+    _, _dl_device = detect_device()
+
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(_dl_device == "cuda"))
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=_dl_device)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -339,8 +374,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+@(torch.no_grad() if torch is not None else lambda f: f)
+def evaluate_bpb(model, tokenizer, batch_size, eval_tokens=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -348,9 +383,9 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=next(model.parameters()).device)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    steps = (eval_tokens or EVAL_TOKENS) // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
@@ -372,6 +407,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
+
+    if args.num_shards < -1:
+        parser.error("num_shards must be -1 (all) or >= 0")
+    if args.download_workers < 1:
+        parser.error("download_workers must be >= 1")
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 

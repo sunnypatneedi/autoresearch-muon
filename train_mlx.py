@@ -585,7 +585,7 @@ t_compiled = None
 while True:
     t0 = time.time()
     accum_grads = None
-    train_loss = None
+    train_loss = 0.0
 
     for _ in range(grad_accum_steps):
         loss, grads = loss_grad_fn(model, x, y)
@@ -593,7 +593,7 @@ while True:
         if t_compiled is None:
             t_compiled = time.time()
             print(f"Model compiled in {t_compiled - t_data:.1f}s")
-        train_loss = loss
+        train_loss += float(loss.item()) / grad_accum_steps
         if accum_grads is None:
             accum_grads = grads
         else:
@@ -613,9 +613,10 @@ while True:
     optimizer.update(accum_grads)
     mx.eval(model.parameters(), *optimizer.state_arrays)
 
-    train_loss_f = float(train_loss.item())
-    if train_loss_f > 100:
-        print("FAIL")
+    train_loss_f = train_loss
+    # Fast fail: abort if loss is exploding or NaN
+    if not train_loss_f <= 100:
+        print(f"FAIL: Loss exploded at step {step} (loss={train_loss_f:.2f})")
         raise SystemExit(1)
 
     dt = time.time() - t0
@@ -651,10 +652,19 @@ print()
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
+# Save pre-eval checkpoint weights
+print("Saving pre-eval checkpoint...")
+flat_params = dict(tree_flatten(model.parameters()))
+import numpy as np
+np.savez('pre_eval_checkpoint.npz', **{k: np.array(v) for k, v in flat_params.items()})
+
 # Final eval (reduced tokens for Apple Silicon)
 print("Starting final eval...")
 eval_tok = 2 * 524288
 val_bpb = evaluate_bpb(model, tokenizer, FINAL_EVAL_BATCH_SIZE, eval_tokens=eval_tok)
+
+# Eval succeeded — remove safety checkpoint
+os.remove('pre_eval_checkpoint.npz')
 
 t_end = time.time()
 peak_vram_mb = mx.get_peak_memory() / 1024 / 1024

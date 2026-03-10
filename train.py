@@ -594,10 +594,11 @@ step = 0
 while True:
     sync_device(device_type)
     t0 = time.time()
+    train_loss = 0.0
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
-        train_loss = loss.detach()
+        train_loss += loss.detach() / grad_accum_steps
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, epoch = next(train_loader)
@@ -617,9 +618,15 @@ while True:
 
     train_loss_f = train_loss.item()
 
-    # Fast fail: abort if loss is exploding
-    if train_loss_f > 100:
-        print("FAIL")
+    # Fast fail: abort if loss is exploding or NaN
+    if not train_loss_f <= 100:
+        print(f"FAIL: Loss exploded at step {step} (loss={train_loss_f:.2f})")
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        torch.save({
+            'step': step,
+            'loss': train_loss_f,
+            'model_state': raw_model.state_dict(),
+        }, f'exploded_step{step}.pt')
         exit(1)
 
     sync_device(device_type)
@@ -658,6 +665,10 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
+# Save pre-eval checkpoint to prevent training loss on eval crash
+raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+torch.save(raw_model.state_dict(), 'pre_eval_checkpoint.pt')
+
 # Final eval (reduce eval tokens on MPS to avoid hour-long eval)
 model.eval()
 if device_type == "mps":
@@ -666,10 +677,13 @@ eval_tok = 2 * 524288 if device_type != "cuda" else None
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, eval_tokens=eval_tok)
 
+# Eval succeeded — remove safety checkpoint
+os.remove('pre_eval_checkpoint.pt')
+
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 11) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 if device_type == "cuda":
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 elif device_type == "mps":

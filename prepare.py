@@ -17,11 +17,15 @@ import argparse
 import pickle
 from multiprocessing import Pool
 
+import numpy as np
 import requests
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -141,9 +145,11 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
 def train_tokenizer():
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    token_bytes_pt = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    token_bytes_npy = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
+    has_token_bytes = os.path.exists(token_bytes_pt) or os.path.exists(token_bytes_npy)
+    if os.path.exists(tokenizer_pkl) and has_token_bytes:
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
         return
 
@@ -191,9 +197,12 @@ def train_tokenizer():
             token_bytes_list.append(0)
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    token_bytes_arr = np.array(token_bytes_list, dtype=np.int32)
+    np.save(token_bytes_npy, token_bytes_arr)
+    print(f"Tokenizer: saved token_bytes to {token_bytes_npy}")
+    if torch is not None:
+        torch.save(torch.from_numpy(token_bytes_arr), token_bytes_pt)
+        print(f"Tokenizer: saved token_bytes to {token_bytes_pt}")
 
     # Sanity check
     test = "Hello world! Numbers: 123. Unicode: 你好"
@@ -255,9 +264,14 @@ class Tokenizer:
 
 
 def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+    pt_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    npy_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    if os.path.exists(pt_path):
+        with open(pt_path, "rb") as f:
+            return torch.load(f, map_location=device)
+    # Fallback: load .npy and convert to torch tensor
+    arr = np.load(npy_path)
+    return torch.from_numpy(arr).to(device)
 
 
 def _document_batches(split, tokenizer_batch_size=128):
@@ -350,7 +364,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
+@(torch.no_grad() if torch is not None else lambda f: f)
 def evaluate_bpb(model, tokenizer, batch_size, eval_tokens=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.

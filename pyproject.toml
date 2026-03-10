@@ -1,16 +1,17 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-muon"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Muon optimizer on every platform. Fork of Karpathy's autoresearch."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "matplotlib>=3.10.8",
     "numpy>=2.2.6",
-    "pandas>=2.3.3",
     "pyarrow>=21.0.0",
     "requests>=2.32.0",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch>=2.6.0",
 ]
+
+[project.optional-dependencies]
+torch = ["torch>=2.6.0", "matplotlib>=3.10.8", "pandas>=2.3.3"]
+mlx = ["mlx>=0.30.0"]

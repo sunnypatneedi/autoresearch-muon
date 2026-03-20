@@ -656,7 +656,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 print("Saving pre-eval checkpoint...")
 flat_params = dict(tree_flatten(model.parameters()))
 import numpy as np
-np.savez('pre_eval_checkpoint.npz', **{k: np.array(v) for k, v in flat_params.items()})
+np.savez('pre_eval_checkpoint.npz', **{k: np.array(v.astype(mx.float32)) for k, v in flat_params.items()})
 
 # Final eval (reduced tokens for Apple Silicon)
 print("Starting final eval...")

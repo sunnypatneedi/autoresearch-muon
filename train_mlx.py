@@ -484,7 +484,7 @@ ASPECT_RATIO = 64
 HEAD_DIM = 128
 WINDOW_PATTERN = "L"
 
-TOTAL_BATCH_SIZE = 2**16
+TOTAL_BATCH_SIZE = 2**14
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
@@ -496,8 +496,8 @@ WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 DEPTH = 4
-DEVICE_BATCH_SIZE = 16
-FINAL_EVAL_BATCH_SIZE = 256
+DEVICE_BATCH_SIZE = 8
+FINAL_EVAL_BATCH_SIZE = 16
 STARTUP_EXCLUDE_STEPS = 1
 
 # ---------------------------------------------------------------------------
@@ -656,7 +656,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 print("Saving pre-eval checkpoint...")
 flat_params = dict(tree_flatten(model.parameters()))
 import numpy as np
-np.savez('pre_eval_checkpoint.npz', **{k: np.array(v) for k, v in flat_params.items()})
+np.savez('pre_eval_checkpoint.npz', **{k: np.array(v.astype(mx.float32)) for k, v in flat_params.items()})
 
 # Final eval (reduced tokens for Apple Silicon)
 print("Starting final eval...")
